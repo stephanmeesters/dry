@@ -9,7 +9,7 @@ Utility functions.
 '''
 
 import numpy as np
-
+from dipy.io.gradients import read_bvals_bvecs
 
 class DryException(Exception):
     def __init__(self, message, errors=0):
@@ -37,7 +37,7 @@ def generate_synthetic_data(bfile):
         raise DryException('generate_synthetic_data did \
                             not raise an excpetion')
 
-    bvals = np.loadtxt(bfile, float, delimiter=' ')
+    bvals, _ = read_bvals_bvecs(bfile, None)
     numbs = bvals.size
 
     Dfw = 3e-3

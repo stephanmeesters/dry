@@ -8,7 +8,7 @@ High level class containing the necessary methods.
 @License: LPGL
 '''
 
-from dry.utils import generate_synthetic_data
+from utils import generate_synthetic_data
 from keras.layers import Dense
 from keras.models import Sequential
 from keras.optimizers import RMSprop
@@ -18,6 +18,21 @@ from sklearn.model_selection import train_test_split
 import nibabel as nb
 import numpy as np
 import os
+from dipy.io.gradients import read_bvals_bvecs
+
+from scipy.ndimage.filters import gaussian_filter
+
+# from pdb import set_trace as bp
+
+import errno
+def mkdir_p(path):
+    try:
+        os.makedirs(path)
+    except OSError as exc:  # Python >2.5
+        if exc.errno == errno.EEXIST and os.path.isdir(path):
+            pass
+        else:
+            raise
 
 
 class Dry:
@@ -55,7 +70,7 @@ class Dry:
     def train_model(self, bfile):
         '''Creates a new model based on the b-values file and trains it'''
         # Model architecture based on the diffuson protocol (bval file)
-        bvals = np.loadtxt(bfile, float, delimiter=' ')
+        bvals, _ = read_bvals_bvecs(bfile, None)
         unique_bvals = np.unique(bvals)
 
         # Train the model
@@ -92,7 +107,7 @@ class Dry:
             raise ValueError("Cannot save an empty model.")
         model.save(mfile)
 
-    def fwe(self, dwis, model, bfile, output_folder=None):
+    def fwe(self, dwis, model, bfile, output_folder=None, mask=None):
         '''Runs the diffusion data through the model to correct for free
         water contamination'''
 
@@ -105,18 +120,19 @@ class Dry:
         if not dwis:
             raise ValueError("Diffusion data is necessary.")
 
-        bvals = np.loadtxt(bfile)
+        bvals, _ = read_bvals_bvecs(bfile, None)
 
-        def _process_dwi(model, dwi, bvals, output_folder):
+        def _process_dwi(model, dwi, bvals, output_folder, mask):
             print("Processing file {}".format(dwi))
             # Load and prepare data
             dwidata, maxdwi, dims, dwinii = self._prepare_dwi_data(dwi)
+            maskdata = self._prepare_mask(mask)
             # Predict tissue volume fraction and correct for free-water
             f = model.predict(dwidata)
             f[np.isnan(f)] = 0
             f[f < 0] = 0
             f[f > 1] = 1
-            St = self._remove_fw_component(dwidata, maxdwi, f, bvals)
+            St, Scsf = self._remove_fw_component(dwidata, maxdwi, f, bvals, maskdata)
             # Save tissue volume fraction and corrected dwi
             f = np.reshape(f, dims[0:3])
             St = np.reshape(St, dims)
@@ -124,14 +140,19 @@ class Dry:
             dwiname = os.path.basename(dwi)
             dwiname = dwiname.split('.')
             output_folder = os.path.join(output_folder, dwiname[0])
-            os.makedirs(output_folder, exist_ok=True)
+            mkdir_p(output_folder)
             nb.save(niif, os.path.join(output_folder,
                                        "tissue_volume_fraction.nii.gz"))
             niiS = nb.Nifti1Image(St, dwinii.affine)
             nb.save(niiS, os.path.join(output_folder, "fwe_dwi.nii.gz"))
 
+            # Save free water map
+            Scsf = np.reshape(Scsf, dims)
+            niiScsf = nb.Nifti1Image(Scsf, dwinii.affine)
+            nb.save(niiScsf, os.path.join(output_folder, "Scsf.nii.gz"))
+
         for dwi in dwis:
-            _process_dwi(model, dwi, bvals, output_folder)
+            _process_dwi(model, dwi, bvals, output_folder, mask)
 
     def fwe_tissue(self, dwi, tissue_volume_fraction, bfile,
                    output_folder=None):
@@ -147,7 +168,7 @@ class Dry:
             raise ValueError("Diffusion data is necessary.")
         if not tissue_volume_fraction:
             raise ValueError("Tissue volume fraction data is necessary.")
-        bvals = np.loadtxt(bfile)
+        bvals, _ = read_bvals_bvecs(bfile, None)
 
         dwidata, maxdwi, dims, dwinii = self._prepare_dwi_data(dwi)
         f = nb.load(tissue_volume_fraction).get_data()
@@ -158,7 +179,7 @@ class Dry:
         dwiname = os.path.basename(dwi)
         dwiname = dwiname.split('.')
         output_folder = os.path.join(output_folder, dwiname[0])
-        os.makedirs(output_folder, exist_ok=True)
+        mkdir_p(output_folder)
         nb.save(niiS, os.path.join(output_folder, "fwe_dwi.nii.gz"))
 
     def _prepare_dwi_data(self, dwi):
@@ -171,13 +192,39 @@ class Dry:
         dwidata = np.divide(dwidata.T, maxdwi.T).T
         return dwidata, maxdwi, dims, dwinii
 
-    def _remove_fw_component(self, dwidata, maxdwi, f, bvals):
+    def _prepare_mask(self, mask):
+        """Private method. Concatenates mask into a 2D matrix"""
+        if mask is None:
+            return None
+        masknii = nb.load(mask)
+        maskdata = masknii.get_fdata()
+        dims = maskdata.shape
+        maskdata = np.reshape(maskdata, (np.prod(dims[0:3]), 1))
+        return maskdata
+
+    def _remove_fw_component(self, dwidata, maxdwi, f, bvals, mask):
         """Private method. Computes the free water signal from bvals and
         substract it from the diffusion data"""
+
+        # bp()
+
+        meanb0 = np.mean(dwidata[:,np.where(bvals<10)],2)
+        fsmooth = gaussian_filter(f, sigma=.5)
+
         Scsf = np.exp(-3e-3*bvals)
-        Scsf = np.multiply(1-f, Scsf)
-        St = np.divide(dwidata - Scsf, f)
+        Scsf = np.multiply(1-fsmooth, Scsf)
+        Scsf = np.multiply(meanb0, Scsf)
+
+        # only apply fw correction within mask
+        if mask is not None:
+            Scsf = Scsf * mask
+
+        Scsf[np.isnan(Scsf)] = 0
+        Scsf[Scsf < 0] = 0
+
+        St = np.divide(dwidata - Scsf, fsmooth)
+        St[:,np.where(bvals<10)] = dwidata[:,np.where(bvals<10)] # leave b=0 volumes untouched
         St = np.multiply(St.T, maxdwi.T).T
         St[np.isnan(St)] = 0
-        St[St < 0] = 0
-        return St
+        # St[St < 0] = 0
+        return (St, Scsf)
